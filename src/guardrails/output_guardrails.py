@@ -4,13 +4,13 @@ Lab 11 — Part 2B: Output Guardrails
   TODO 7: LLM-as-Judge safety check
   TODO 8: Output Guardrail Plugin (ADK)
 """
+import os
 import re
 import textwrap
 
 from google.genai import types
-from google.adk.agents import llm_agent
-from google.adk import runners
 from google.adk.plugins import base_plugin
+from core.openai_adapter import OpenAIRunner
 
 from core.utils import chat_with_agent
 
@@ -41,12 +41,12 @@ def content_filter(response: str) -> dict:
 
     # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "VN Phone": r"0\d{9,10}",
+        "Email": r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}",
+        "National ID": r"\b\d{9}\b|\b\d{12}\b",
+        "API Key": r"sk-[a-zA-Z0-9-]+",
+        "Password": r"password\s*[:=]\s*\S+",
+        "Internal DB": r"db\..*\.internal"
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -102,30 +102,37 @@ judge_runner = None
 
 
 def _init_judge():
-    """Initialize the judge agent and runner (call after creating the agent)."""
-    global judge_runner
-    if safety_judge_agent is not None:
-        judge_runner = runners.InMemoryRunner(
-            agent=safety_judge_agent, app_name="safety_judge"
+    """Initialize the judge agent and runner using OpenAI."""
+    global safety_judge_agent, judge_runner
+    if judge_runner is None:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        judge_runner = OpenAIRunner(
+            agent_name="safety_judge",
+            instruction=SAFETY_JUDGE_INSTRUCTION,
+            api_key=api_key
         )
 
 
 async def llm_safety_check(response_text: str) -> dict:
-    """Use LLM judge to check if response is safe.
+    """Use OpenAI judge to check if response is safe."""
+    if judge_runner is None:
+        _init_judge()
 
-    Args:
-        response_text: The agent's response to evaluate
-
-    Returns:
-        dict with 'safe' (bool) and 'verdict' (str)
-    """
-    if safety_judge_agent is None or judge_runner is None:
-        return {"safe": True, "verdict": "Judge not initialized — skipping"}
-
-    prompt = f"Evaluate this AI response for safety:\n\n{response_text}"
-    verdict, _ = await chat_with_agent(safety_judge_agent, judge_runner, prompt)
-    is_safe = "SAFE" in verdict.upper() and "UNSAFE" not in verdict.upper()
-    return {"safe": is_safe, "verdict": verdict.strip()}
+    try:
+        prompt = f"Evaluate this AI response for safety:\n\n{response_text}"
+        # Passing None for agent as our OpenAIRunner handles everything
+        verdict, _ = await chat_with_agent(None, judge_runner, prompt)
+        
+        # chat_with_agent might return a string or an object with .text
+        if hasattr(verdict, "text"):
+            verdict_text = verdict.text
+        else:
+            verdict_text = str(verdict)
+            
+        is_safe = "SAFE" in verdict_text.upper() and "UNSAFE" not in verdict_text.upper()
+        return {"safe": is_safe, "verdict": verdict_text.strip()}
+    except Exception as e:
+        return {"safe": False, "verdict": f"ERROR: {e}"}
 
 
 # ============================================================
@@ -145,16 +152,24 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
 
     def __init__(self, use_llm_judge=True):
         super().__init__(name="output_guardrail")
-        self.use_llm_judge = use_llm_judge and (safety_judge_agent is not None)
+        from .output_guardrails import judge_runner
+        self.use_llm_judge = use_llm_judge
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
 
     def _extract_text(self, llm_response) -> str:
-        """Extract text from LLM response."""
+        """Extract text from LLM response (supports ADK and OpenAI shim)."""
+        if hasattr(llm_response, "text"):
+            return llm_response.text
+        
         text = ""
         if hasattr(llm_response, "content") and llm_response.content:
             for part in llm_response.content.parts:
+                if hasattr(part, "text") and part.text:
+                    text += part.text
+        elif hasattr(llm_response, "parts"):
+            for part in llm_response.parts:
                 if hasattr(part, "text") and part.text:
                     text += part.text
         return text
@@ -172,16 +187,24 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Apply Content Filter (Redaction) (TODO 6)
+        filter_result = content_filter(response_text)
+        if not filter_result["safe"]:
+            self.redacted_count += 1
+            response_text = filter_result["redacted"]
+            # Update response text in the Content object
+            llm_response.content.parts = [types.Part.from_text(text=response_text)]
 
-        return llm_response  # TODO: modify if needed
+        # 2. Apply LLM-as-Judge Safety Check (TODO 7)
+        if self.use_llm_judge:
+            safety_result = await llm_safety_check(response_text)
+            if not safety_result["safe"]:
+                self.blocked_count += 1
+                # Replace with security block message
+                block_msg = "🛑 Security Block: The response was flagged as unsafe by our automated safety judge."
+                llm_response.content.parts = [types.Part.from_text(text=block_msg)]
+
+        return llm_response
 
 
 # ============================================================
